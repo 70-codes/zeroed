@@ -1,0 +1,319 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Zeroed DoS Protection Daemon - Configuration File
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This is the main configuration file for the Zeroed daemon.
+# Edit this file to customize the behavior of the DoS protection system.
+#
+# For more information, see: https://github.com/security/zeroed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daemon Settings
+# ─────────────────────────────────────────────────────────────────────────────
+[daemon]
+# Path to the PID file
+pid_file = "/var/run/zeroed/zeroed.pid"
+
+# User to run as after dropping root privileges (recommended)
+user = "zeroed"
+
+# Group to run as
+group = "zeroed"
+
+# Working directory for the daemon
+working_dir = "/var/lib/zeroed"
+
+# Run as a background daemon (set to false for debugging)
+daemonize = true
+
+# Number of worker threads (0 = auto-detect based on CPU cores)
+worker_threads = 0
+
+# Maximum memory usage in MB (0 = unlimited)
+max_memory_mb = 512
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network Monitoring
+# ─────────────────────────────────────────────────────────────────────────────
+[network]
+# Network interfaces to monitor (empty = all non-loopback interfaces)
+# Example: ["eth0", "ens33", "enp0s3"]
+interfaces = []
+
+# Enable promiscuous mode for packet capture
+promiscuous = true
+
+# Packet capture buffer size in MB
+capture_buffer_mb = 64
+
+# BPF filter expression for packet capture (optional)
+# Example: "tcp port 80 or tcp port 443"
+# Leave empty to capture all IP traffic
+# bpf_filter = ""
+
+# Specific ports to monitor (empty = all ports)
+# Common ports: HTTP(80), HTTPS(443), SSH(22), DNS(53), MySQL(3306), PostgreSQL(5432)
+monitored_ports = [80, 443, 22, 53, 25, 3306, 5432, 8080, 8443]
+
+# Enable IPv6 monitoring
+enable_ipv6 = true
+
+# Maximum bytes to capture per packet (65535 = full packet)
+snap_len = 65535
+
+# Packet capture timeout in milliseconds
+capture_timeout_ms = 1000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detection and Rate Limiting
+# ─────────────────────────────────────────────────────────────────────────────
+[detection]
+# Requests per second threshold per IP (triggers warning/alert)
+rps_threshold = 100
+
+# Requests per second threshold per IP (triggers automatic block)
+rps_block_threshold = 500
+
+# Time window for rate calculation in seconds
+rate_window = 60
+
+# Connection tracking window in seconds
+connection_window = 300
+
+# Maximum concurrent connections per IP
+max_connections_per_ip = 100
+
+# SYN flood detection threshold (SYN packets per second from single IP)
+syn_flood_threshold = 1000
+
+# UDP flood detection threshold (packets per second)
+udp_flood_threshold = 5000
+
+# ICMP flood detection threshold (packets per second)
+icmp_flood_threshold = 500
+
+# Slowloris detection: minimum data rate in bytes/sec
+# Connections slower than this may be considered slowloris attacks
+slowloris_min_rate = 100
+
+# Track MAC addresses for Layer 2 correlation
+track_mac_addresses = true
+
+# Whitelisted IP addresses (never blocked)
+# Include your own IP addresses and trusted services here
+whitelist_ips = []
+
+# Whitelisted CIDR ranges (never blocked)
+# Private networks are whitelisted by default
+whitelist_cidrs = [
+    "127.0.0.0/8",      # Localhost
+    "10.0.0.0/8",       # Private Class A
+    "172.16.0.0/12",    # Private Class B
+    "192.168.0.0/16",   # Private Class C
+]
+
+# Blacklisted IP addresses (always blocked)
+blacklist_ips = []
+
+# Blacklisted CIDR ranges (always blocked)
+blacklist_cidrs = []
+
+# Auto-block duration for detected attackers in seconds (default: 1 hour)
+block_duration = 3600
+
+# Enable adaptive thresholds based on historical traffic patterns
+adaptive_thresholds = true
+
+# Detection sensitivity level: 1 (low) to 10 (high)
+# Higher values = more aggressive detection (more false positives)
+# Lower values = less aggressive (may miss some attacks)
+sensitivity = 5
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Storage Configuration (Custom Efficient File System)
+# ─────────────────────────────────────────────────────────────────────────────
+[storage]
+# Base directory for data storage
+data_dir = "/var/lib/zeroed/data"
+
+# Storage format: "binary" (most efficient), "mmap" (fastest reads), "ringbuffer"
+format = "binary"
+
+# Maximum storage size in MB (0 = unlimited)
+max_size_mb = 1024
+
+# Enable data compression
+compression = true
+
+# Compression level (1-9, higher = more compression, slower)
+compression_level = 6
+
+# Time-to-live for stored records in seconds (default: 7 days)
+record_ttl = 604800
+
+# Flush interval for in-memory data in seconds
+flush_interval = 30
+
+# Number of shards for parallel writes
+shard_count = 16
+
+# Enable write-ahead logging for crash recovery
+wal_enabled = true
+
+# Ring buffer size for recent events (number of events to keep in memory)
+ring_buffer_size = 100000
+
+# Bloom filter false positive rate (0.0 to 1.0)
+# Lower = more accurate but more memory
+bloom_fp_rate = 0.01
+
+# Expected number of unique IPs (for bloom filter sizing)
+expected_unique_ips = 1000000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GeoIP Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+[geoip]
+# Enable GeoIP lookups for geographic threat analysis
+enabled = true
+
+# Path to MaxMind GeoLite2-City database
+# Download from: https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+database_path = "/var/lib/zeroed/GeoLite2-City.mmdb"
+
+# Auto-update GeoIP database (requires MaxMind license key)
+auto_update = false
+
+# Update check interval in seconds (default: weekly)
+update_interval = 604800
+
+# MaxMind license key for automatic updates (optional)
+# license_key = "your_license_key_here"
+
+# Cache size for GeoIP lookups
+cache_size = 10000
+
+# Countries to block (ISO 3166-1 alpha-2 codes)
+# Example: ["CN", "RU", "KP"]
+blocked_countries = []
+
+# Countries to allow (if set, ONLY these countries are allowed)
+# Leave empty to allow all countries
+allowed_countries = []
+
+# Regions requiring extra scrutiny (higher sensitivity)
+suspicious_regions = []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Firewall Integration
+# ─────────────────────────────────────────────────────────────────────────────
+[firewall]
+# Enable automatic firewall rule management
+enabled = true
+
+# Firewall backend: "iptables", "nftables", or "ipset"
+backend = "iptables"
+
+# Chain name for zeroed rules
+chain_name = "ZEROED"
+
+# Table name for zeroed rules
+table_name = "filter"
+
+# IPSet name for blocked IPs (when using ipset backend)
+ipset_name = "zeroed_blocklist"
+
+# Use ipset for efficient large blocklists (recommended)
+use_ipset = true
+
+# Maximum number of firewall rules
+max_rules = 10000
+
+# Dry run mode - log rules but don't apply them (for testing)
+dry_run = false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+[logging]
+# Log level: "trace", "debug", "info", "warn", "error"
+level = "info"
+
+# Log output: "stdout", "stderr", "file", "syslog"
+output = "file"
+
+# Log file path (when output = "file")
+file_path = "/var/log/zeroed/zeroed.log"
+
+# Enable JSON formatted logs (useful for log aggregation)
+json_format = false
+
+# Maximum log file size in MB before rotation
+max_file_size_mb = 100
+
+# Number of rotated log files to keep
+max_files = 10
+
+# Include source code location in logs (useful for debugging)
+include_location = false
+
+# Separate security log file for attack events
+security_log_path = "/var/log/zeroed/security.log"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API and Control Interface
+# ─────────────────────────────────────────────────────────────────────────────
+[api]
+# Enable control API
+enabled = true
+
+# Unix socket path for local control (zeroctl command)
+socket_path = "/var/run/zeroed/zeroed.sock"
+
+# Enable HTTP REST API
+http_enabled = false
+
+# HTTP API bind address (use 127.0.0.1 for local only)
+http_bind = "127.0.0.1"
+
+# HTTP API port
+http_port = 8080
+
+# Enable TLS for HTTP API
+tls_enabled = false
+
+# TLS certificate path
+# tls_cert_path = "/etc/zeroed/ssl/cert.pem"
+
+# TLS key path
+# tls_key_path = "/etc/zeroed/ssl/key.pem"
+
+# API authentication token (required for HTTP API)
+# Generate with: openssl rand -hex 32
+# auth_token = "your_secure_token_here"
+
+# Allowed client IPs for API access
+allowed_clients = ["127.0.0.1", "::1"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metrics and Monitoring
+# ─────────────────────────────────────────────────────────────────────────────
+[metrics]
+# Enable metrics collection
+enabled = true
+
+# Enable Prometheus metrics exporter
+prometheus_enabled = true
+
+# Prometheus exporter bind address
+prometheus_bind = "0.0.0.0"
+
+# Prometheus exporter port
+prometheus_port = 9090
+
+# Metrics collection interval in seconds
+collection_interval = 10
+
+# Enable internal statistics tracking
+internal_stats = true
