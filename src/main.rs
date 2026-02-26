@@ -39,11 +39,15 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use crate::detection::DetectionEngine;
+use crate::firewall::FirewallManager;
+
 // Import our modules
 mod api;
 mod core;
 mod daemon;
 mod detection;
+mod firewall;
 mod geo;
 mod network;
 mod storage;
@@ -364,6 +368,46 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
     info!("Initializing network capture...");
     let network_manager = Arc::new(network::NetworkManager::new(10_000));
 
+    // Initialize detection engine
+    info!("Initializing detection engine...");
+    let detection_engine = Arc::new(DetectionEngine::new(config.detection.clone()));
+    info!(
+        "Detection engine ready (RPS threshold: {}, block threshold: {}, SYN flood: {}, UDP flood: {}, ICMP flood: {})",
+        config.detection.rps_threshold,
+        config.detection.rps_block_threshold,
+        config.detection.syn_flood_threshold,
+        config.detection.udp_flood_threshold,
+        config.detection.icmp_flood_threshold,
+    );
+
+    // Initialize firewall manager
+    info!("Initializing firewall manager...");
+    let firewall_manager = Arc::new(
+        FirewallManager::new(config.firewall.clone()).map_err(|e| {
+            error!("Failed to initialize firewall manager: {}", e);
+            e
+        })?,
+    );
+
+    // Create the ZEROED chain in iptables (idempotent)
+    if config.firewall.enabled {
+        if let Err(e) = firewall_manager.ensure_chain() {
+            warn!("Could not set up firewall chain (non-fatal): {}", e);
+        }
+
+        // Sync with any pre-existing rules from a previous daemon run
+        match firewall_manager.sync_with_chain() {
+            Ok((added, removed)) if added > 0 || removed > 0 => {
+                info!(
+                    "Firewall chain sync: {} pre-existing rules imported, {} stale entries removed",
+                    added, removed
+                );
+            }
+            Ok(_) => debug!("Firewall chain sync: already in sync"),
+            Err(e) => debug!("Firewall chain sync skipped: {}", e),
+        }
+    }
+
     // Get interface to monitor
     let interface = if config.network.interfaces.is_empty() {
         network::capture::CaptureEngine::default_interface()?
@@ -402,8 +446,11 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
     let processing_handle = {
         let storage = Arc::clone(&storage);
         let network_manager = Arc::clone(&network_manager);
-        let detection_config = config.detection.clone();
+        let detection_engine = Arc::clone(&detection_engine);
+        let firewall = Arc::clone(&firewall_manager);
+        let block_duration = config.detection.block_duration;
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut threats_logged = 0u64;
 
         tokio::spawn(async move {
             let mut packets_processed = 0u64;
@@ -423,14 +470,97 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
                         }
 
                         // Update connection tracker
-                        network_manager.connection_tracker().update(&record);
+                        let conn_tracker = network_manager.connection_tracker();
+                        conn_tracker.update(&record);
 
-                        // Check rate limits and update tracking
-                        // TODO: Implement detection logic here
+                        // Feed live connection count into the detection engine
+                        // so it can check connection exhaustion accurately
+                        let connections_for_ip = conn_tracker
+                            .get_connections_for_ip(record.src_ip)
+                            .len() as u64;
+                        detection_engine.update_connection_count(
+                            record.src_ip,
+                            connections_for_ip,
+                        );
+
+                        // Run detection analysis on this packet
+                        let detection_result = detection_engine.analyze(&record);
+
+                        if detection_result.is_threat() {
+                            threats_logged += 1;
+
+                            // Update the IP tracking entry in storage with
+                            // the detection verdict
+                            let mut tracking = storage
+                                .get_ip_tracking(&record.src_ip)
+                                .unwrap_or_else(|| {
+                                    crate::core::types::IpTrackingEntry::new(record.src_ip)
+                                });
+
+                            tracking.threat_level = detection_result.threat_level;
+                            tracking.threat_score = detection_result.threat_score;
+                            tracking.attack_types = detection_result.attack_types.clone();
+                            tracking.update_last_seen();
+
+                            if detection_result.should_block() {
+                                tracking.is_blocked = true;
+                                tracking.block_count += 1;
+                                tracking.block_expires = Some(
+                                    chrono::Utc::now()
+                                        + chrono::Duration::from_std(block_duration)
+                                            .unwrap_or(chrono::Duration::hours(1)),
+                                );
+
+                                warn!(
+                                    "BLOCK DECISION: IP={} threat={:?} score={:.2} attacks={:?} reason=\"{}\"",
+                                    record.src_ip,
+                                    detection_result.threat_level,
+                                    detection_result.threat_score,
+                                    detection_result.attack_types,
+                                    detection_result.reason,
+                                );
+
+                                // Apply the block via the firewall manager
+                                match firewall.block_ip(
+                                    record.src_ip,
+                                    block_duration,
+                                    detection_result.reason.clone(),
+                                ) {
+                                    Ok(true) => {
+                                        info!("Firewall: blocked {} for {}s", record.src_ip, block_duration.as_secs());
+                                    }
+                                    Ok(false) => {
+                                        debug!("Firewall: {} already blocked (updated expiry)", record.src_ip);
+                                    }
+                                    Err(e) => {
+                                        error!("Firewall: failed to block {}: {}", record.src_ip, e);
+                                    }
+                                }
+                            } else {
+                                info!(
+                                    "THREAT DETECTED: IP={} threat={:?} score={:.2} action={:?} reason=\"{}\"",
+                                    record.src_ip,
+                                    detection_result.threat_level,
+                                    detection_result.threat_score,
+                                    detection_result.action,
+                                    detection_result.reason,
+                                );
+                            }
+
+                            storage.upsert_ip_tracking(tracking);
+                        }
 
                         // Log progress periodically
                         if packets_processed % 10_000 == 0 {
-                            info!("Processed {} packets", packets_processed);
+                            let det_stats = detection_engine.stats();
+                            info!(
+                                "Processed {} packets | Detection: {} analyzed, {} attacks detected, {} threats logged, {} IPs tracked",
+                                packets_processed,
+                                det_stats.packets_analyzed,
+                                det_stats.attacks_detected,
+                                threats_logged,
+                                det_stats.tracked_ips,
+                            );
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -440,9 +570,10 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
                 }
             }
 
+            let det_stats = detection_engine.stats();
             info!(
-                "Packet processor stopped. Total processed: {}",
-                packets_processed
+                "Packet processor stopped. Total processed: {} | Threats logged: {} | Attacks detected: {}",
+                packets_processed, threats_logged, det_stats.attacks_detected,
             );
         })
     };
@@ -450,6 +581,11 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
     // Spawn periodic maintenance task
     let maintenance_handle = {
         let storage = Arc::clone(&storage);
+        let detection_engine = Arc::clone(&detection_engine);
+        let network_manager = Arc::clone(&network_manager);
+        let firewall = Arc::clone(&firewall_manager);
+        let rate_window = config.detection.rate_window;
+        let connection_window = config.detection.connection_window;
         let mut shutdown_rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -461,6 +597,8 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
                         // Periodic maintenance
                         debug!("Running periodic maintenance...");
 
+                        // ── Storage maintenance ──────────────────────────
+
                         // Flush storage
                         if let Err(e) = storage.flush().await {
                             warn!("Storage flush error: {}", e);
@@ -471,13 +609,58 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
                             warn!("Storage cleanup error: {}", e);
                         }
 
-                        // Log statistics
-                        let stats = storage.stats();
+                        // ── Detection engine maintenance ─────────────────
+
+                        // Reset detection windows for IPs whose rate_window
+                        // has elapsed, so counters reflect current traffic
+                        // rather than accumulating forever
+                        let windows_reset = detection_engine.reset_stale_windows();
+
+                        // Evict IP detection states that haven't been seen
+                        // within the connection_window (default: 5 minutes)
+                        let evicted = detection_engine.cleanup(
+                            chrono::Duration::from_std(connection_window)
+                                .unwrap_or(chrono::Duration::minutes(5)),
+                        );
+
+                        // ── Connection tracker maintenance ────────────────
+
+                        // Clean up expired connections from the tracker
+                        network_manager.connection_tracker().cleanup_expired();
+
+                        // ── Firewall maintenance ─────────────────────────
+
+                        // Unblock IPs whose block duration has expired
+                        let fw_expired = match firewall.cleanup_expired() {
+                            Ok(n) => n,
+                            Err(e) => {
+                                warn!("Firewall cleanup error: {}", e);
+                                0
+                            }
+                        };
+
+                        // ── Log statistics ────────────────────────────────
+
+                        let storage_stats = storage.stats();
+                        let det_stats = detection_engine.stats();
+                        let fw_stats = firewall.stats();
                         info!(
-                            "Storage stats: {} records written, {} ring buffer entries, {} tracked IPs",
-                            stats.records_written,
+                            "Maintenance: storage={} written/{} ring/{} IPs | \
+                             detection={} analyzed/{} attacks/{} tracked ({} windows reset, {} evicted) | \
+                             firewall={} blocked/{} total ({} expired this cycle) | \
+                             connections={}",
+                            storage_stats.records_written,
                             storage.ring_buffer_size(),
-                            storage.ip_cache_size()
+                            storage.ip_cache_size(),
+                            det_stats.packets_analyzed,
+                            det_stats.attacks_detected,
+                            det_stats.tracked_ips,
+                            windows_reset,
+                            evicted,
+                            fw_stats.currently_blocked,
+                            fw_stats.total_blocks,
+                            fw_expired,
+                            network_manager.connection_tracker().connection_count(),
                         );
                     }
                     _ = shutdown_rx.recv() => {
@@ -534,6 +717,15 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
     // Final storage flush
     info!("Performing final storage flush...");
     storage.shutdown().await?;
+
+    // Log final firewall state (rules persist in iptables for protection)
+    let fw_final = firewall_manager.stats();
+    if fw_final.currently_blocked > 0 {
+        info!(
+            "Firewall: {} IPs remain blocked in chain '{}' (rules persist across restart)",
+            fw_final.currently_blocked, fw_final.chain_name
+        );
+    }
 
     info!("Zeroed daemon stopped");
     Ok(())
