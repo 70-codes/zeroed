@@ -231,6 +231,280 @@ enum Commands {
         /// Input file
         file: PathBuf,
     },
+
+    /// Manage deployed applications
+    App {
+        #[command(subcommand)]
+        subcmd: AppCommands,
+    },
+
+    /// Manage SSH keys for GitHub access
+    SshKey {
+        #[command(subcommand)]
+        subcmd: SshKeyCommands,
+    },
+
+    /// Manage port allocations
+    Ports {
+        #[command(subcommand)]
+        subcmd: PortCommands,
+    },
+
+    /// Manage SSL certificates
+    Ssl {
+        #[command(subcommand)]
+        subcmd: SslCommands,
+    },
+}
+
+/// App management subcommands
+#[derive(Subcommand, Debug)]
+enum AppCommands {
+    /// Create a new application
+    Create {
+        /// Application name (slug format: lowercase, hyphens only)
+        name: String,
+
+        /// Git repository URL
+        #[arg(long)]
+        repo: String,
+
+        /// Application type: backend, static, hybrid
+        #[arg(long, default_value = "backend")]
+        r#type: String,
+
+        /// Port for the application (backend/hybrid only)
+        #[arg(long, default_value = "0")]
+        port: u16,
+
+        /// Git branch
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// SSH key ID for private repos
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Custom domain name
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Build command (e.g. "npm run build")
+        #[arg(long)]
+        build_cmd: Option<String>,
+
+        /// Start command (e.g. "node server.js")
+        #[arg(long)]
+        start_cmd: Option<String>,
+
+        /// Build output directory (e.g. "dist", "build")
+        #[arg(long)]
+        build_dir: Option<String>,
+
+        /// Enable SPA mode (try_files fallback to index.html)
+        #[arg(long)]
+        spa: bool,
+    },
+
+    /// Deploy or redeploy an application
+    Deploy {
+        /// Application name
+        name: String,
+
+        /// Override branch for this deploy
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Force deploy even if no new commits
+        #[arg(long)]
+        force: bool,
+
+        /// Skip dependency installation
+        #[arg(long)]
+        skip_deps: bool,
+
+        /// Skip build step
+        #[arg(long)]
+        skip_build: bool,
+
+        /// Skip health check after deploy
+        #[arg(long)]
+        skip_health_check: bool,
+    },
+
+    /// List all managed applications
+    List,
+
+    /// Show detailed information about an application
+    Info {
+        /// Application name
+        name: String,
+    },
+
+    /// Stop a running application
+    Stop {
+        /// Application name
+        name: String,
+    },
+
+    /// Start a stopped application
+    Start {
+        /// Application name
+        name: String,
+    },
+
+    /// Restart an application
+    Restart {
+        /// Application name
+        name: String,
+    },
+
+    /// Delete an application
+    Delete {
+        /// Application name
+        name: String,
+
+        /// Also delete all files on disk
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// View application logs (from journalctl)
+    Logs {
+        /// Application name
+        name: String,
+
+        /// Number of log lines to show
+        #[arg(short, long, default_value = "50")]
+        lines: usize,
+
+        /// Show logs since this time (journalctl format)
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Rollback to a previous release
+    Rollback {
+        /// Application name
+        name: String,
+
+        /// Target deploy ID to rollback to (default: previous successful)
+        #[arg(long)]
+        to: Option<String>,
+    },
+
+    /// List deployment history / releases
+    Releases {
+        /// Application name
+        name: String,
+    },
+
+    /// Change an application's port
+    Port {
+        /// Application name
+        name: String,
+
+        /// New port number
+        port: u16,
+    },
+
+    /// Set or change an application's domain
+    Domain {
+        /// Application name
+        name: String,
+
+        /// Domain name
+        domain: String,
+    },
+
+    /// Manage SSL for an application
+    SslCmd {
+        /// Application name
+        name: String,
+
+        /// Action: enable, disable, status
+        action: String,
+    },
+
+    /// Show the generated nginx config
+    Nginx {
+        /// Application name
+        name: String,
+    },
+
+    /// Manage environment variables
+    Env {
+        /// Application name
+        name: String,
+
+        /// Action: list, set KEY=VALUE, unset KEY
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+}
+
+/// SSH key management subcommands
+#[derive(Subcommand, Debug)]
+enum SshKeyCommands {
+    /// Generate a new SSH key
+    Generate {
+        /// Key name (human-friendly label)
+        name: String,
+
+        /// Key type: ed25519 (default), rsa
+        #[arg(long, default_value = "ed25519")]
+        r#type: String,
+    },
+
+    /// List all managed SSH keys
+    List,
+
+    /// Delete an SSH key
+    Delete {
+        /// Key ID or name
+        id: String,
+    },
+
+    /// Show the public key (for pasting into GitHub)
+    ShowPublic {
+        /// Key ID or name
+        id: String,
+    },
+
+    /// Test SSH connectivity to GitHub
+    Test {
+        /// Key ID or name
+        id: String,
+    },
+}
+
+/// Port management subcommands
+#[derive(Subcommand, Debug)]
+enum PortCommands {
+    /// List all allocated ports
+    List,
+
+    /// Check if a port is available
+    Check {
+        /// Port number to check
+        port: u16,
+    },
+}
+
+/// SSL management subcommands
+#[derive(Subcommand, Debug)]
+enum SslCommands {
+    /// List all managed certificates
+    List,
+
+    /// Check all certificates for expiry
+    Check,
+
+    /// Manually renew a certificate
+    Renew {
+        /// Domain name
+        domain: String,
+    },
 }
 
 /// List subcommands
@@ -352,6 +626,38 @@ enum ApiRequest {
         what: String,
         data: String,
     },
+    // Deploy commands
+    CreateApp { name: String, repo_url: String, app_type: String, port: u16, branch: Option<String>, ssh_key_id: Option<String>, domain: Option<String>, build_cmd: Option<String>, start_cmd: Option<String>, build_dir: Option<String>, spa: bool },
+    DeployApp { name: String, branch: Option<String>, force: bool, skip_deps: bool, skip_build: bool, skip_health_check: bool },
+    StopApp { name: String },
+    StartApp { name: String },
+    RestartApp { name: String },
+    DeleteApp { name: String, force: bool },
+    AppInfo { name: String },
+    ListApps,
+    AppLogs { name: String, lines: usize, since: Option<String> },
+    RollbackApp { name: String, target_id: Option<String> },
+    AppReleases { name: String },
+    AppSetPort { name: String, port: u16 },
+    AppSetDomain { name: String, domain: String },
+    AppEnableSsl { name: String },
+    AppDisableSsl { name: String },
+    AppNginxShow { name: String },
+    AppEnvSet { name: String, key: String, value: String },
+    AppEnvUnset { name: String, key: String },
+    AppEnvList { name: String },
+    // SSH key commands
+    SshKeyGenerate { name: String, key_type: Option<String> },
+    SshKeyList,
+    SshKeyDelete { id: String },
+    SshKeyShowPublic { id: String },
+    SshKeyTest { id: String },
+    // Port & SSL commands
+    PortsList,
+    PortCheck { port: u16 },
+    SslList,
+    SslCheck,
+    SslRenew { domain: String },
 }
 
 /// Response from the daemon
@@ -477,6 +783,79 @@ fn build_request(cmd: &Commands) -> Result<ApiRequest, String> {
                 data,
             }
         }
+
+        // ── App Commands ─────────────────────────────────────────────
+        Commands::App { subcmd } => match subcmd {
+            AppCommands::Create { name, repo, r#type, port, branch, key, domain, build_cmd, start_cmd, build_dir, spa } => {
+                ApiRequest::CreateApp {
+                    name: name.clone(), repo_url: repo.clone(), app_type: r#type.clone(),
+                    port: *port, branch: branch.clone(), ssh_key_id: key.clone(),
+                    domain: domain.clone(), build_cmd: build_cmd.clone(),
+                    start_cmd: start_cmd.clone(), build_dir: build_dir.clone(), spa: *spa,
+                }
+            }
+            AppCommands::Deploy { name, branch, force, skip_deps, skip_build, skip_health_check } => {
+                ApiRequest::DeployApp {
+                    name: name.clone(), branch: branch.clone(), force: *force,
+                    skip_deps: *skip_deps, skip_build: *skip_build, skip_health_check: *skip_health_check,
+                }
+            }
+            AppCommands::List => ApiRequest::ListApps,
+            AppCommands::Info { name } => ApiRequest::AppInfo { name: name.clone() },
+            AppCommands::Stop { name } => ApiRequest::StopApp { name: name.clone() },
+            AppCommands::Start { name } => ApiRequest::StartApp { name: name.clone() },
+            AppCommands::Restart { name } => ApiRequest::RestartApp { name: name.clone() },
+            AppCommands::Delete { name, force } => ApiRequest::DeleteApp { name: name.clone(), force: *force },
+            AppCommands::Logs { name, lines, since } => ApiRequest::AppLogs { name: name.clone(), lines: *lines, since: since.clone() },
+            AppCommands::Rollback { name, to } => ApiRequest::RollbackApp { name: name.clone(), target_id: to.clone() },
+            AppCommands::Releases { name } => ApiRequest::AppReleases { name: name.clone() },
+            AppCommands::Port { name, port } => ApiRequest::AppSetPort { name: name.clone(), port: *port },
+            AppCommands::Domain { name, domain } => ApiRequest::AppSetDomain { name: name.clone(), domain: domain.clone() },
+            AppCommands::SslCmd { name, action } => match action.as_str() {
+                "enable" => ApiRequest::AppEnableSsl { name: name.clone() },
+                "disable" => ApiRequest::AppDisableSsl { name: name.clone() },
+                _ => return Err(format!("Unknown SSL action '{}'. Use: enable, disable", action)),
+            },
+            AppCommands::Nginx { name } => ApiRequest::AppNginxShow { name: name.clone() },
+            AppCommands::Env { name, args } => {
+                if args.is_empty() || args[0] == "list" {
+                    ApiRequest::AppEnvList { name: name.clone() }
+                } else if args[0] == "set" && args.len() >= 2 {
+                    let kv = &args[1];
+                    if let Some((k, v)) = kv.split_once('=') {
+                        ApiRequest::AppEnvSet { name: name.clone(), key: k.to_string(), value: v.to_string() }
+                    } else {
+                        return Err("Usage: app env <name> set KEY=VALUE".to_string());
+                    }
+                } else if args[0] == "unset" && args.len() >= 2 {
+                    ApiRequest::AppEnvUnset { name: name.clone(), key: args[1].clone() }
+                } else {
+                    return Err("Usage: app env <name> [list|set KEY=VALUE|unset KEY]".to_string());
+                }
+            }
+        },
+
+        // ── SSH Key Commands ─────────────────────────────────────────
+        Commands::SshKey { subcmd } => match subcmd {
+            SshKeyCommands::Generate { name, r#type } => ApiRequest::SshKeyGenerate { name: name.clone(), key_type: Some(r#type.clone()) },
+            SshKeyCommands::List => ApiRequest::SshKeyList,
+            SshKeyCommands::Delete { id } => ApiRequest::SshKeyDelete { id: id.clone() },
+            SshKeyCommands::ShowPublic { id } => ApiRequest::SshKeyShowPublic { id: id.clone() },
+            SshKeyCommands::Test { id } => ApiRequest::SshKeyTest { id: id.clone() },
+        },
+
+        // ── Port Commands ────────────────────────────────────────────
+        Commands::Ports { subcmd } => match subcmd {
+            PortCommands::List => ApiRequest::PortsList,
+            PortCommands::Check { port } => ApiRequest::PortCheck { port: *port },
+        },
+
+        // ── SSL Commands ─────────────────────────────────────────────
+        Commands::Ssl { subcmd } => match subcmd {
+            SslCommands::List => ApiRequest::SslList,
+            SslCommands::Check => ApiRequest::SslCheck,
+            SslCommands::Renew { domain } => ApiRequest::SslRenew { domain: domain.clone() },
+        },
     };
 
     Ok(request)
@@ -546,6 +925,196 @@ fn display_response(cli: &Cli, cmd: &Commands, response: ApiResponse) -> Result<
 /// Display response as formatted text
 fn display_text_response(cmd: &Commands, data: &serde_json::Value) -> Result<(), String> {
     match cmd {
+        // ── Deploy display handlers ──────────────────────────────────
+        Commands::App { subcmd } => {
+            match subcmd {
+                AppCommands::List => {
+                    if let Some(apps) = data.get("apps").and_then(|a| a.as_array()) {
+                        if apps.is_empty() {
+                            println!("No applications registered.");
+                        } else {
+                            println!("{:<20} {:<12} {:<10} {:<8} {:<20} {:<10}", "NAME", "TYPE", "STATUS", "PORT", "DOMAIN", "COMMIT");
+                            println!("{}", "─".repeat(80));
+                            for app in apps {
+                                println!("{:<20} {:<12} {:<10} {:<8} {:<20} {:<10}",
+                                    app["name"].as_str().unwrap_or("-"),
+                                    app["app_type"].as_str().unwrap_or("-"),
+                                    app["status"].as_str().unwrap_or("-"),
+                                    app["port"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                                    app["domain"].as_str().unwrap_or("-"),
+                                    app["current_commit"].as_str().unwrap_or("-"),
+                                );
+                            }
+                        }
+                        if let Some(summary) = data.get("summary") {
+                            println!("\nTotal: {} | Running: {} | Stopped: {} | Failed: {}",
+                                summary["total"].as_u64().unwrap_or(0),
+                                summary["running"].as_u64().unwrap_or(0),
+                                summary["stopped"].as_u64().unwrap_or(0),
+                                summary["failed"].as_u64().unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                AppCommands::Info { .. } => {
+                    if let Some(obj) = data.as_object() {
+                        println!("Application: {}", obj.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+                        println!("{}", "─".repeat(50));
+                        for (key, val) in obj {
+                            let display_val = if val.is_null() { "-".to_string() } else { format!("{}", val).trim_matches('"').to_string() };
+                            println!("  {:<20} {}", format_key(key), display_val);
+                        }
+                    }
+                }
+                AppCommands::Deploy { .. } => {
+                    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if success {
+                        println!("✓ Deployment successful");
+                        println!("  Deploy ID: {}", data["deploy_id"].as_str().unwrap_or("?"));
+                        println!("  Commit:    {}", data["commit"].as_str().unwrap_or("?"));
+                        println!("  Duration:  {}s", data["duration_secs"].as_u64().unwrap_or(0));
+                        if let Some(warns) = data.get("warnings").and_then(|w| w.as_array()) {
+                            for w in warns {
+                                println!("  ⚠ {}", w.as_str().unwrap_or(""));
+                            }
+                        }
+                    } else {
+                        println!("✗ Deployment failed");
+                        if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+                            println!("  Error: {}", err);
+                        }
+                    }
+                }
+                AppCommands::Logs { .. } => {
+                    if let Some(logs) = data.get("logs").and_then(|v| v.as_str()) {
+                        print!("{}", logs);
+                    }
+                }
+                AppCommands::Releases { .. } => {
+                    if let Some(releases) = data.get("releases").and_then(|r| r.as_array()) {
+                        println!("{:<26} {:<10} {:<10} {:<8} {:<8} {}", "ID", "STATUS", "COMMIT", "BRANCH", "SECS", "TRIGGER");
+                        println!("{}", "─".repeat(80));
+                        for r in releases {
+                            println!("{:<26} {:<10} {:<10} {:<8} {:<8} {}",
+                                r["id"].as_str().unwrap_or("-"),
+                                r["status"].as_str().unwrap_or("-"),
+                                r["commit"].as_str().unwrap_or("-"),
+                                r["branch"].as_str().unwrap_or("-"),
+                                r["duration_secs"].as_u64().map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+                                r["trigger"].as_str().unwrap_or("-"),
+                            );
+                        }
+                    }
+                }
+                AppCommands::Nginx { .. } => {
+                    if let Some(config) = data.get("nginx_config").and_then(|v| v.as_str()) {
+                        println!("{}", config);
+                    }
+                }
+                AppCommands::Env { .. } => {
+                    if let Some(env) = data.get("env").and_then(|e| e.as_object()) {
+                        for (k, v) in env {
+                            println!("{}={}", k, v.as_str().unwrap_or(""));
+                        }
+                    } else {
+                        // Single set/unset response
+                        println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+                    }
+                }
+                _ => {
+                    // Generic JSON output for other app subcommands
+                    println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+                }
+            }
+        }
+
+        Commands::SshKey { subcmd } => {
+            match subcmd {
+                SshKeyCommands::List => {
+                    if let Some(keys) = data.get("keys").and_then(|k| k.as_array()) {
+                        if keys.is_empty() {
+                            println!("No SSH keys registered.");
+                        } else {
+                            println!("{:<34} {:<16} {:<10} {:<30}", "ID", "NAME", "TYPE", "FINGERPRINT");
+                            println!("{}", "─".repeat(90));
+                            for k in keys {
+                                println!("{:<34} {:<16} {:<10} {:<30}",
+                                    k["id"].as_str().unwrap_or("-"),
+                                    k["name"].as_str().unwrap_or("-"),
+                                    k["key_type"].as_str().unwrap_or("-"),
+                                    k["fingerprint"].as_str().unwrap_or("-"),
+                                );
+                            }
+                        }
+                    }
+                }
+                SshKeyCommands::ShowPublic { .. } => {
+                    if let Some(pk) = data.get("public_key").and_then(|v| v.as_str()) {
+                        println!("{}", pk);
+                    }
+                }
+                _ => {
+                    println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+                }
+            }
+        }
+
+        Commands::Ports { subcmd } => {
+            match subcmd {
+                PortCommands::List => {
+                    if let Some(allocs) = data.get("allocations").and_then(|a| a.as_array()) {
+                        if allocs.is_empty() {
+                            println!("No ports allocated.");
+                        } else {
+                            println!("{:<8} {:<20}", "PORT", "APPLICATION");
+                            println!("{}", "─".repeat(30));
+                            for a in allocs {
+                                println!("{:<8} {:<20}",
+                                    a["port"].as_u64().unwrap_or(0),
+                                    a["app"].as_str().unwrap_or("-"),
+                                );
+                            }
+                        }
+                    }
+                }
+                PortCommands::Check { port } => {
+                    let available = data.get("available").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if available {
+                        println!("✓ Port {} is available", port);
+                    } else {
+                        println!("✗ Port {} is NOT available: {}", port,
+                            data.get("details").and_then(|v| v.as_str()).unwrap_or("unknown reason"));
+                    }
+                }
+            }
+        }
+
+        Commands::Ssl { subcmd } => {
+            match subcmd {
+                SslCommands::List => {
+                    if let Some(certs) = data.get("certificates").and_then(|c| c.as_array()) {
+                        if certs.is_empty() {
+                            println!("No SSL certificates managed.");
+                        } else {
+                            println!("{:<30} {:<14} {:<14} {:<6}", "DOMAIN", "STATUS", "PROVIDER", "DAYS");
+                            println!("{}", "─".repeat(65));
+                            for c in certs {
+                                println!("{:<30} {:<14} {:<14} {:<6}",
+                                    c["domain"].as_str().unwrap_or("-"),
+                                    c["status"].as_str().unwrap_or("-"),
+                                    c["provider"].as_str().unwrap_or("-"),
+                                    c["days_until_expiry"].as_i64().map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+                }
+            }
+        }
+
         Commands::Status => {
             println!("╔════════════════════════════════════════════════════════════╗");
             println!("║              Zeroed Daemon Status                          ║");

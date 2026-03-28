@@ -55,7 +55,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 // Re-export commonly used types
 pub use bloom::BloomFilter;
@@ -546,7 +546,34 @@ impl StorageEngine {
             keep
         });
 
-        // TODO: Clean up archived data
+        // Clean up archived data
+        let archive_dir = self.data_dir.join("archive");
+        if archive_dir.exists() {
+            let archive_config = crate::storage::archive::ArchiveConfig {
+                base_dir: archive_dir,
+                max_age_days: (self.config.record_ttl.as_secs() / 86400) as u32,
+                compression: self.config.compression,
+                compression_level: self.config.compression_level,
+            };
+            match crate::storage::archive::ArchiveManager::new(archive_config) {
+                Ok(archive_mgr) => {
+                    match archive_mgr.cleanup() {
+                        Ok(archive_removed) => {
+                            if archive_removed > 0 {
+                                info!("Archive cleanup removed {} old date directories", archive_removed);
+                                removed += archive_removed;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Archive cleanup error: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Could not initialize archive manager for cleanup: {}", e);
+                }
+            }
+        }
 
         info!("Cleanup removed {} expired entries", removed);
         Ok(removed)

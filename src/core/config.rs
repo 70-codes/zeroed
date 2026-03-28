@@ -47,6 +47,10 @@ pub struct ZeroedConfig {
     /// Metrics and monitoring
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Application deployment management
+    #[serde(default)]
+    pub deploy: DeployConfig,
 }
 
 impl Default for ZeroedConfig {
@@ -61,6 +65,7 @@ impl Default for ZeroedConfig {
             logging: LoggingConfig::default(),
             api: ApiConfig::default(),
             metrics: MetricsConfig::default(),
+            deploy: DeployConfig::default(),
         }
     }
 }
@@ -562,6 +567,122 @@ mod humantime_serde {
         Ok(Duration::from_secs(secs))
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deployment Management Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for the application deployment management subsystem.
+///
+/// This is included in the main `zeroed.toml` under the `[deploy]` section.
+/// The deploy subsystem is optional — the daemon's core DoS protection
+/// functions work without it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployConfig {
+    /// Whether the deployment subsystem is enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Base directory for all managed applications
+    #[serde(default = "default_apps_dir")]
+    pub apps_dir: PathBuf,
+
+    /// Directory for storing SSH keys
+    #[serde(default = "default_ssh_keys_dir")]
+    pub ssh_keys_dir: PathBuf,
+
+    /// Nginx sites-available directory
+    #[serde(default = "default_nginx_sites_dir")]
+    pub nginx_sites_dir: PathBuf,
+
+    /// Nginx sites-enabled directory
+    #[serde(default = "default_nginx_enabled_dir")]
+    pub nginx_enabled_dir: PathBuf,
+
+    /// Directory for systemd unit files
+    #[serde(default = "default_systemd_units_dir")]
+    pub systemd_units_dir: PathBuf,
+
+    /// Directory where SSL certificates are stored (e.g. /etc/letsencrypt/live)
+    #[serde(default = "default_ssl_certs_dir")]
+    pub ssl_certs_dir: PathBuf,
+
+    /// Email address for ACME / Let's Encrypt account registration
+    #[serde(default)]
+    pub acme_email: String,
+
+    /// Start of the port range available for application allocation
+    #[serde(default = "default_port_range_start")]
+    pub default_port_range_start: u16,
+
+    /// End of the port range available for application allocation
+    #[serde(default = "default_port_range_end")]
+    pub default_port_range_end: u16,
+
+    /// Maximum number of managed applications
+    #[serde(default = "default_max_apps")]
+    pub max_apps: usize,
+
+    /// Maximum number of deploy history records to keep per app
+    #[serde(default = "default_max_deploy_history")]
+    pub max_deploy_history: usize,
+
+    /// Timeout in seconds for build steps
+    #[serde(default = "default_build_timeout_secs")]
+    pub build_timeout_secs: u64,
+
+    /// Timeout in seconds for health check probes after deploy
+    #[serde(default = "default_health_check_timeout_secs")]
+    pub health_check_timeout_secs: u64,
+
+    /// Number of health check retries before marking a deploy as failed
+    #[serde(default = "default_health_check_retries")]
+    pub health_check_retries: u32,
+
+    /// Path to the application registry file
+    #[serde(default = "default_registry_path")]
+    pub registry_path: PathBuf,
+}
+
+impl Default for DeployConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            apps_dir: PathBuf::from("/var/lib/zeroed/apps"),
+            ssh_keys_dir: PathBuf::from("/var/lib/zeroed/ssh/keys"),
+            nginx_sites_dir: PathBuf::from("/etc/nginx/sites-available"),
+            nginx_enabled_dir: PathBuf::from("/etc/nginx/sites-enabled"),
+            systemd_units_dir: PathBuf::from("/etc/systemd/system"),
+            ssl_certs_dir: PathBuf::from("/etc/letsencrypt/live"),
+            acme_email: String::new(),
+            default_port_range_start: 3000,
+            default_port_range_end: 9999,
+            max_apps: 100,
+            max_deploy_history: 10,
+            build_timeout_secs: 600,
+            health_check_timeout_secs: 30,
+            health_check_retries: 5,
+            registry_path: PathBuf::from("/var/lib/zeroed/deploy/registry.toml"),
+        }
+    }
+}
+
+// Serde default value helper functions for DeployConfig
+fn default_true() -> bool { true }
+fn default_apps_dir() -> PathBuf { PathBuf::from("/var/lib/zeroed/apps") }
+fn default_ssh_keys_dir() -> PathBuf { PathBuf::from("/var/lib/zeroed/ssh/keys") }
+fn default_nginx_sites_dir() -> PathBuf { PathBuf::from("/etc/nginx/sites-available") }
+fn default_nginx_enabled_dir() -> PathBuf { PathBuf::from("/etc/nginx/sites-enabled") }
+fn default_systemd_units_dir() -> PathBuf { PathBuf::from("/etc/systemd/system") }
+fn default_ssl_certs_dir() -> PathBuf { PathBuf::from("/etc/letsencrypt/live") }
+fn default_port_range_start() -> u16 { 3000 }
+fn default_port_range_end() -> u16 { 9999 }
+fn default_max_apps() -> usize { 100 }
+fn default_max_deploy_history() -> usize { 10 }
+fn default_build_timeout_secs() -> u64 { 600 }
+fn default_health_check_timeout_secs() -> u64 { 30 }
+fn default_health_check_retries() -> u32 { 5 }
+fn default_registry_path() -> PathBuf { PathBuf::from("/var/lib/zeroed/deploy/registry.toml") }
 
 impl ZeroedConfig {
     /// Load configuration from a TOML file

@@ -33,12 +33,17 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
+use crate::api::handler::CommandHandler;
+use crate::api::socket::ApiServer;
+use crate::deploy::DeployManager;
 use crate::detection::DetectionEngine;
 use crate::firewall::FirewallManager;
 
@@ -46,6 +51,7 @@ use crate::firewall::FirewallManager;
 mod api;
 mod core;
 mod daemon;
+mod deploy;
 mod detection;
 mod firewall;
 mod geo;
@@ -408,6 +414,53 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
         }
     }
 
+    // Initialize deploy manager (optional — daemon works without it)
+    // Wrapped in Arc<Mutex> so the API handler can get mutable access
+    let deploy_manager: Option<Arc<std::sync::Mutex<DeployManager>>> = if config.deploy.enabled {
+        info!("Initializing deployment manager...");
+        match DeployManager::new(config.deploy.clone()) {
+            Ok(dm) => {
+                // Run preflight checks and log results
+                let preflight = dm.preflight_check();
+                for item in &preflight.items {
+                    match item.severity {
+                        crate::deploy::CheckSeverity::Ok => {
+                            info!("Deploy preflight: ✓ {}", item.message);
+                        }
+                        crate::deploy::CheckSeverity::Warning => {
+                            warn!("Deploy preflight: ⚠ {}", item.message);
+                        }
+                        crate::deploy::CheckSeverity::Error => {
+                            error!("Deploy preflight: ✗ {}", item.message);
+                        }
+                    }
+                }
+
+                if preflight.is_ok() {
+                    info!("Deploy manager initialized — all preflight checks passed");
+                } else {
+                    warn!(
+                        "Deploy manager initialized with {} error(s) — some deploy features may not work",
+                        preflight.errors().len()
+                    );
+                }
+
+                Some(Arc::new(std::sync::Mutex::new(dm)))
+            }
+            Err(e) => {
+                warn!(
+                    "Deploy manager initialization failed (non-fatal): {} — \
+                     deployment features will be unavailable",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        info!("Deployment manager disabled by configuration ([deploy] enabled = false)");
+        None
+    };
+
     // Get interface to monitor
     let interface = if config.network.interfaces.is_empty() {
         network::capture::CaptureEngine::default_interface()?
@@ -417,10 +470,51 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
 
     info!("Monitoring interface: {}", interface);
 
+    // Create shared packets_processed counter (used by processing task and API handler)
+    let packets_processed = Arc::new(AtomicU64::new(0));
+
     // Create capture engine
     let capture_config = config.network.clone();
     let capture_engine = network::capture::CaptureEngine::new(capture_config);
     let capture_stats = capture_engine.stats();
+
+    // Initialize API socket server
+    let api_handle = if config.api.enabled {
+        info!("Initializing API server on {:?}...", config.api.socket_path);
+
+        let mut handler_builder = CommandHandler::new(
+            Arc::clone(&storage),
+            Arc::clone(&detection_engine),
+            Arc::clone(&firewall_manager),
+            Arc::clone(&network_manager),
+            shutdown_tx.clone(),
+            Instant::now(),
+            Arc::clone(&packets_processed),
+            APP_VERSION.to_string(),
+            vec![interface.clone()],
+        );
+
+        // Attach deploy manager if available
+        if let Some(ref dm) = deploy_manager {
+            handler_builder = handler_builder.with_deploy_manager(Arc::clone(dm));
+        }
+
+        let handler = Arc::new(handler_builder);
+
+        let api_server = ApiServer::new(
+            config.api.socket_path.clone(),
+            handler,
+            64, // max concurrent connections
+        );
+
+        let shutdown_rx = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            api_server.run(shutdown_rx).await;
+        }))
+    } else {
+        info!("API server disabled by configuration");
+        None
+    };
 
     // Spawn capture task
     let capture_handle = {
@@ -451,17 +545,19 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
         let block_duration = config.detection.block_duration;
         let mut shutdown_rx = shutdown_tx.subscribe();
         let mut threats_logged = 0u64;
+        let packets_counter = Arc::clone(&packets_processed);
 
         tokio::spawn(async move {
-            let mut packets_processed = 0u64;
+            let mut local_packets_processed = 0u64;
 
             loop {
                 tokio::select! {
                     Some(packet) = packet_rx.recv() => {
-                        packets_processed += 1;
+                        local_packets_processed += 1;
+                        packets_counter.fetch_add(1, Ordering::Relaxed);
 
                         // Create connection record from captured packet
-                        let id = packets_processed;
+                        let id = local_packets_processed;
                         let record = packet.to_connection_record(id);
 
                         // Store the record
@@ -551,11 +647,11 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
                         }
 
                         // Log progress periodically
-                        if packets_processed % 10_000 == 0 {
+                        if local_packets_processed % 10_000 == 0 {
                             let det_stats = detection_engine.stats();
                             info!(
                                 "Processed {} packets | Detection: {} analyzed, {} attacks detected, {} threats logged, {} IPs tracked",
-                                packets_processed,
+                                local_packets_processed,
                                 det_stats.packets_analyzed,
                                 det_stats.attacks_detected,
                                 threats_logged,
@@ -573,9 +669,39 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
             let det_stats = detection_engine.stats();
             info!(
                 "Packet processor stopped. Total processed: {} | Threats logged: {} | Attacks detected: {}",
-                packets_processed, threats_logged, det_stats.attacks_detected,
+                local_packets_processed, threats_logged, det_stats.attacks_detected,
             );
         })
+    };
+
+    // Spawn SSL certificate renewal background task (if deploy manager is active)
+    let ssl_renewal_handle = if let Some(ref _dm) = deploy_manager {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+
+        Some(tokio::spawn(async move {
+            // Check every 24 hours for certificates that need renewal
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(86400));
+            // Skip the immediate first tick
+            interval.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        info!("SSL renewal check: scanning for expiring certificates...");
+                        // NOTE: actual renewal calls will be wired in Step 5 when
+                        // DeployManager gets high-level methods. For now this task
+                        // just logs that it ran.
+                        info!("SSL renewal check complete");
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("SSL renewal task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+        }))
+    } else {
+        None
     };
 
     // Spawn periodic maintenance task
@@ -707,6 +833,12 @@ async fn async_main(config: ZeroedConfig) -> Result<()> {
         let _ = capture_handle.await;
         let _ = processing_handle.await;
         let _ = maintenance_handle.await;
+        if let Some(handle) = api_handle {
+            let _ = handle.await;
+        }
+        if let Some(handle) = ssl_renewal_handle {
+            let _ = handle.await;
+        }
     })
     .await;
 
@@ -1008,7 +1140,29 @@ fn is_process_running(pid: i32) -> bool {
     }
 }
 
-/// Get Rust compiler version (placeholder)
-fn rustc_version() -> &'static str {
-    "1.75.0" // Would be populated at build time
+/// Get Rust compiler version.
+///
+/// Uses the CARGO_PKG_RUST_VERSION env var if set (from Cargo.toml's
+/// `rust-version` field), otherwise returns the version baked in at
+/// compile time via the rustc_version build script approach.
+fn rustc_version() -> String {
+    // Try the Cargo-provided minimum rust version first
+    if let Some(v) = option_env!("CARGO_PKG_RUST_VERSION") {
+        if !v.is_empty() {
+            return format!("{} (minimum)", v);
+        }
+    }
+
+    // Fall back to runtime detection via `rustc --version`
+    match std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let version_str = String::from_utf8_lossy(&output.stdout);
+            // Output format: "rustc 1.XX.Y (hash date)"
+            version_str.trim().to_string()
+        }
+        _ => "unknown".to_string(),
+    }
 }

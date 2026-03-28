@@ -700,16 +700,19 @@ impl SshKeyManager {
 
     /// Associate a GitHub username with a key.
     pub fn set_github_username(&mut self, id: &str, username: &str) -> Result<()> {
-        let entry = self
-            .registry
-            .keys
-            .get_mut(id)
-            .ok_or_else(|| SshKeyError::KeyNotFound { id: id.to_string() })?;
+        let name = {
+            let entry = self
+                .registry
+                .keys
+                .get_mut(id)
+                .ok_or_else(|| SshKeyError::KeyNotFound { id: id.to_string() })?;
 
-        entry.github_username = Some(username.to_string());
+            entry.github_username = Some(username.to_string());
+            entry.name.clone()
+        };
         self.registry.save(&self.registry_path)?;
 
-        info!("SSH key '{}' associated with GitHub user: {}", entry.name, username);
+        info!("SSH key '{}' associated with GitHub user: {}", name, username);
         Ok(())
     }
 
@@ -1039,7 +1042,12 @@ fn generate_key_id() -> String {
         // Mix in some process-level entropy
         h ^= std::process::id() as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
-        h ^= std::thread::current().id().as_u64().into();
+        // Use Debug format of thread ID for stable Rust compatibility
+        let tid = format!("{:?}", std::thread::current().id());
+        for byte in tid.as_bytes() {
+            h ^= *byte as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
         h
     };
 

@@ -572,15 +572,25 @@ impl SslManager {
             })?;
 
         if output.status.success() {
-            // Update registry entry
+            // Read the cert path and expiry BEFORE taking a mutable borrow on the registry,
+            // to avoid the borrow checker conflict (self.read_cert_expiry borrows self immutably
+            // while get_mut borrows self.registry mutably).
+            let expiry = self
+                .registry
+                .certificates
+                .get(domain)
+                .map(|c| c.cert_path.clone())
+                .and_then(|path| self.read_cert_expiry(&path));
+
+            // Now take the mutable borrow to update the entry
             if let Some(cert_info) = self.registry.certificates.get_mut(domain) {
                 cert_info.status = CertStatus::Valid;
                 cert_info.last_renewed_at = Some(Utc::now());
                 cert_info.renewal_count += 1;
                 cert_info.last_error = None;
 
-                if let Some(expiry) = self.read_cert_expiry(&cert_info.cert_path) {
-                    cert_info.expires_at = Some(expiry);
+                if let Some(exp) = expiry {
+                    cert_info.expires_at = Some(exp);
                 }
 
                 let updated = cert_info.clone();
@@ -804,6 +814,19 @@ impl SslManager {
 
     /// Check the status of a certificate and update the registry.
     pub fn check_certificate(&mut self, domain: &str) -> Result<CertInfo> {
+        // Clone the cert path first to avoid borrow conflict with self.read_cert_expiry
+        let cert_path = self
+            .registry
+            .certificates
+            .get(domain)
+            .ok_or_else(|| SslError::CertNotFound {
+                domain: domain.to_string(),
+            })?
+            .cert_path
+            .clone();
+
+        let expiry = self.read_cert_expiry(&cert_path);
+
         let cert_info = self
             .registry
             .certificates
@@ -812,9 +835,8 @@ impl SslManager {
                 domain: domain.to_string(),
             })?;
 
-        // Re-read expiry from disk
-        if let Some(expiry) = self.read_cert_expiry(&cert_info.cert_path) {
-            cert_info.expires_at = Some(expiry);
+        if let Some(exp) = expiry {
+            cert_info.expires_at = Some(exp);
         }
 
         cert_info.refresh_status();

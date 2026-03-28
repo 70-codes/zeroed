@@ -62,7 +62,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -1286,6 +1286,702 @@ impl DeploymentPipeline {
             .lock()
             .map(|active| active.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Deploy Orchestration
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Execute the full deployment pipeline for an application.
+    ///
+    /// This is the core orchestration method that chains all pipeline steps
+    /// in order. Each step is tracked via a `StepRecord` and logged to both
+    /// the deploy log file and the tracing system.
+    ///
+    /// On any step failure, the pipeline attempts to rollback to the previous
+    /// release (if one exists) before returning a failure result.
+    ///
+    /// The deploy lock is held for the entire duration via RAII (`DeployLock`).
+    pub fn deploy(
+        &self,
+        app: &mut Application,
+        ssh_keys: &SshKeyManager,
+        nginx: &NginxManager,
+        systemd: &SystemdManager,
+        options: &DeployOptions,
+    ) -> std::result::Result<DeployResult, PipelineError> {
+        let start_time = Instant::now();
+        let branch = options.effective_branch(&app.branch);
+
+        // ── Step 1: Acquire deploy lock ──────────────────────────────────
+        let _lock = self.acquire_lock(&app.name)?;
+
+        info!("Starting deployment for '{}' (branch: {})", app.name, branch);
+
+        // Ensure deploy directories exist
+        let _ = fs::create_dir_all(app.repo_dir());
+        let _ = fs::create_dir_all(app.releases_dir());
+        let _ = fs::create_dir_all(app.deploys_dir());
+        let _ = fs::create_dir_all(app.shared_dir());
+
+        // Create deploy history manager
+        let history = DeployHistory::new(app.deploys_dir(), self.config.max_deploy_history)
+            .map_err(|e| PipelineError::StepFailed {
+                step: "pre_deploy".to_string(),
+                message: format!("Failed to init deploy history: {}", e),
+            })?;
+
+        // Create deploy record
+        let mut record = DeployRecord::new(
+            app.id.clone(),
+            app.name.clone(),
+            branch.clone(),
+            options.trigger.clone(),
+        );
+        record.previous_deploy_id = app.current_deploy_id.clone();
+
+        // Create deploy log writer
+        let mut log_writer = history.create_log_writer(&record.id).map_err(|e| {
+            PipelineError::StepFailed {
+                step: "pre_deploy".to_string(),
+                message: format!("Failed to create deploy log: {}", e),
+            }
+        })?;
+
+        let _ = log_writer.log(&format!(
+            "Deployment started for '{}' (branch: {}, trigger: {})",
+            app.name, branch, record.trigger
+        ));
+        let _ = log_writer.separator();
+
+        // Set app status to Deploying
+        app.status = AppStatus::Deploying;
+
+        // Track state across steps
+        let mut commit_hash = String::new();
+        let mut commit_message: Option<String> = None;
+        let mut detected_project: Option<DetectedProject> = None;
+        let mut release_dir: Option<PathBuf> = None;
+        let mut warnings: Vec<String> = Vec::new();
+        let mut rolled_back = false;
+
+        // Get SSH command if needed
+        let ssh_command: Option<String> = if let Some(ref key_id) = app.ssh_key_id {
+            match ssh_keys.git_ssh_command(key_id) {
+                Ok(cmd) => Some(cmd),
+                Err(e) => {
+                    let msg = format!("Failed to get SSH command for key '{}': {}", key_id, e);
+                    let _ = log_writer.log_error(&msg);
+                    record.finish_failure(msg.clone());
+                    let _ = history.save_record(&record);
+                    let _ = log_writer.finalize();
+                    app.status = AppStatus::Failed;
+                    return Ok(DeployResult::failure(
+                        record.id, app.name.clone(), branch, 0,
+                        msg, Some("pre_deploy".to_string()), false,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let ssh_cmd_ref = ssh_command.as_deref();
+
+        // ── Step 2: Git clone or pull ────────────────────────────────────
+        let repo_dir = app.repo_dir();
+        let is_first_deploy = !repo_dir.join(".git").exists();
+
+        let git_step = if is_first_deploy {
+            let _ = log_writer.log_step_start(&PipelineStep::GitClone);
+            let mut step_rec = StepRecord::start(PipelineStep::GitClone);
+            if repo_dir.exists() {
+                let _ = fs::remove_dir_all(&repo_dir);
+                let _ = fs::create_dir_all(&repo_dir);
+            }
+            match Self::git_clone(&app.repo_url, &repo_dir, &branch, ssh_cmd_ref) {
+                Ok(_) => {
+                    step_rec.finish_success_with_output(format!("Cloned {} (branch: {})", app.repo_url, branch));
+                    let _ = log_writer.log(&format!("Cloned {} into {:?}", app.repo_url, repo_dir));
+                    let _ = log_writer.log_step_end(&PipelineStep::GitClone, true);
+                    record.add_step(step_rec);
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log_error(&msg);
+                    let _ = log_writer.log_step_end(&PipelineStep::GitClone, false);
+                    record.add_step(step_rec);
+                    Err(msg)
+                }
+            }
+        } else {
+            let _ = log_writer.log_step_start(&PipelineStep::GitPull);
+            let mut step_rec = StepRecord::start(PipelineStep::GitPull);
+            match Self::git_pull(&repo_dir, &branch, ssh_cmd_ref) {
+                Ok(_) => {
+                    step_rec.finish_success_with_output(format!("Pulled branch '{}'", branch));
+                    let _ = log_writer.log(&format!("Pulled latest for branch '{}'", branch));
+                    let _ = log_writer.log_step_end(&PipelineStep::GitPull, true);
+                    record.add_step(step_rec);
+                    Ok(())
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log_error(&msg);
+                    let _ = log_writer.log_step_end(&PipelineStep::GitPull, false);
+                    record.add_step(step_rec);
+                    Err(msg)
+                }
+            }
+        };
+
+        if let Err(msg) = git_step {
+            record.finish_failure(msg.clone());
+            app.status = AppStatus::Failed;
+            let _ = history.save_record(&record);
+            let _ = log_writer.finalize();
+            let failed_step = record.failed_step().map(|s| s.step.to_string());
+            return Ok(DeployResult::failure(
+                record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                msg, failed_step, false,
+            ));
+        }
+
+        // Get commit info
+        commit_hash = Self::git_current_commit(&repo_dir).unwrap_or_default();
+        commit_message = Self::git_current_commit_message(&repo_dir).ok().filter(|m| !m.is_empty());
+        record.set_commit(commit_hash.clone(), commit_message.clone());
+        let _ = log_writer.log(&format!(
+            "Commit: {} — {}",
+            if commit_hash.len() >= 7 { &commit_hash[..7] } else { &commit_hash },
+            commit_message.as_deref().unwrap_or("(no message)")
+        ));
+
+        // ── Step 3: Detect project type ──────────────────────────────────
+        {
+            let _ = log_writer.log_step_start(&PipelineStep::Detect);
+            let mut step_rec = StepRecord::start(PipelineStep::Detect);
+            let project = Self::detect_project_type(&repo_dir);
+            let pkg_mgr = Self::detect_package_manager(&repo_dir);
+            let msg = format!("Detected: {} (package manager: {})", project, pkg_mgr);
+            detected_project = Some(project);
+            step_rec.finish_success_with_output(msg.clone());
+            let _ = log_writer.log(&msg);
+            let _ = log_writer.log_step_end(&PipelineStep::Detect, true);
+            record.add_step(step_rec);
+        }
+
+        let project_type = detected_project.clone().unwrap_or(DetectedProject::Unknown);
+
+        // Apply detected defaults where the app config doesn't override
+        if app.build_command.is_none() {
+            if let Some(cmd) = project_type.default_build_command() {
+                app.build_command = Some(cmd.to_string());
+                let _ = log_writer.log(&format!("Auto-set build command: {}", cmd));
+            }
+        }
+        if app.build_output_dir.is_none() {
+            if let Some(dir) = project_type.default_build_output_dir() {
+                app.build_output_dir = Some(dir.to_string());
+                let _ = log_writer.log(&format!("Auto-set build output dir: {}", dir));
+            }
+        }
+        if app.start_command.is_none() && app.app_type.needs_service() {
+            if let Some(cmd) = project_type.default_start_command() {
+                app.start_command = Some(cmd.to_string());
+                let _ = log_writer.log(&format!("Auto-set start command: {}", cmd));
+            }
+        }
+
+        // ── Step 4: Install dependencies ─────────────────────────────────
+        if !options.skip_deps {
+            if let Some(install_cmd) = project_type.default_install_deps_command() {
+                let _ = log_writer.log_step_start(&PipelineStep::InstallDeps);
+                let mut step_rec = StepRecord::start(PipelineStep::InstallDeps);
+                let cmd_str = install_cmd.to_string();
+
+                match Self::run_command(&cmd_str, &repo_dir, &options.env_overrides, Some(self.config.build_timeout_secs)) {
+                    Ok(result) if result.success => {
+                        step_rec.finish_success_with_output(format!("Installed via: {}", cmd_str));
+                        let _ = log_writer.log(&format!("Dependencies installed: {}", cmd_str));
+                        let _ = log_writer.log_step_end(&PipelineStep::InstallDeps, true);
+                    }
+                    Ok(result) => {
+                        let msg = format!("Dependency install failed: {}", result.error_summary());
+                        step_rec.finish_failure(msg.clone());
+                        let _ = log_writer.log_error(&msg);
+                        let _ = log_writer.log_step_end(&PipelineStep::InstallDeps, false);
+                        record.add_step(step_rec);
+                        record.finish_failure(msg.clone());
+                        app.status = AppStatus::Failed;
+                        let _ = history.save_record(&record);
+                        let _ = log_writer.finalize();
+                        return Ok(DeployResult::failure(
+                            record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                            msg, Some("install_deps".to_string()), false,
+                        ));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to run install command: {}", e);
+                        step_rec.finish_failure(msg.clone());
+                        let _ = log_writer.log_error(&msg);
+                        let _ = log_writer.log_step_end(&PipelineStep::InstallDeps, false);
+                        record.add_step(step_rec);
+                        record.finish_failure(msg.clone());
+                        app.status = AppStatus::Failed;
+                        let _ = history.save_record(&record);
+                        let _ = log_writer.finalize();
+                        return Ok(DeployResult::failure(
+                            record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                            msg, Some("install_deps".to_string()), false,
+                        ));
+                    }
+                }
+                record.add_step(step_rec);
+            }
+        } else {
+            let _ = log_writer.log("Skipping dependency install (--skip-deps)");
+        }
+
+        // ── Step 5: Build ────────────────────────────────────────────────
+        if !options.skip_build {
+            if let Some(build_cmd) = app.build_command.clone() {
+                let _ = log_writer.log_step_start(&PipelineStep::Build);
+                let mut step_rec = StepRecord::start(PipelineStep::Build);
+
+                match Self::run_command(&build_cmd, &repo_dir, &options.env_overrides, Some(self.config.build_timeout_secs)) {
+                    Ok(result) if result.success => {
+                        step_rec.finish_success_with_output(format!("Build completed: {}", build_cmd));
+                        let _ = log_writer.log(&format!("Build succeeded: {}", build_cmd));
+                        let _ = log_writer.log_step_end(&PipelineStep::Build, true);
+                    }
+                    Ok(result) => {
+                        let msg = format!("Build failed (exit {}): {}", result.exit_code.unwrap_or(-1), result.error_summary());
+                        step_rec.finish_failure(msg.clone());
+                        let _ = log_writer.log_error(&msg);
+                        let _ = log_writer.log_step_end(&PipelineStep::Build, false);
+                        record.add_step(step_rec);
+                        record.finish_failure(msg.clone());
+                        app.status = AppStatus::Failed;
+                        let _ = history.save_record(&record);
+                        let _ = log_writer.finalize();
+                        return Ok(DeployResult::failure(
+                            record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                            msg, Some("build".to_string()), false,
+                        ));
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to run build command: {}", e);
+                        step_rec.finish_failure(msg.clone());
+                        let _ = log_writer.log_error(&msg);
+                        let _ = log_writer.log_step_end(&PipelineStep::Build, false);
+                        record.add_step(step_rec);
+                        record.finish_failure(msg.clone());
+                        app.status = AppStatus::Failed;
+                        let _ = history.save_record(&record);
+                        let _ = log_writer.finalize();
+                        return Ok(DeployResult::failure(
+                            record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                            msg, Some("build".to_string()), false,
+                        ));
+                    }
+                }
+                record.add_step(step_rec);
+            }
+        } else {
+            let _ = log_writer.log("Skipping build (--skip-build)");
+        }
+
+        // ── Step 6: Verify build output ──────────────────────────────────
+        if app.app_type.has_static_files() {
+            if let Some(ref build_dir) = app.build_output_dir {
+                let expected = repo_dir.join(build_dir);
+                let _ = log_writer.log_step_start(&PipelineStep::VerifyBuild);
+                let mut step_rec = StepRecord::start(PipelineStep::VerifyBuild);
+
+                if expected.exists() && expected.is_dir() {
+                    let count = fs::read_dir(&expected).map(|d| d.count()).unwrap_or(0);
+                    if count > 0 {
+                        step_rec.finish_success_with_output(format!("Verified: {:?} ({} entries)", expected, count));
+                        let _ = log_writer.log_step_end(&PipelineStep::VerifyBuild, true);
+                    } else {
+                        let msg = format!("Build output {:?} is empty", expected);
+                        step_rec.finish_failure(msg.clone());
+                        let _ = log_writer.log(&format!("WARNING: {}", msg));
+                        let _ = log_writer.log_step_end(&PipelineStep::VerifyBuild, false);
+                        warnings.push(msg);
+                    }
+                } else {
+                    let msg = format!("Build output {:?} does not exist", expected);
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log(&format!("WARNING: {}", msg));
+                    let _ = log_writer.log_step_end(&PipelineStep::VerifyBuild, false);
+                    warnings.push(msg);
+                }
+                record.add_step(step_rec);
+            }
+        }
+
+        // ── Step 7: Create release + activate symlink ────────────────────
+        let release_name = crate::deploy::app::history::release_dir_name(&Utc::now(), &commit_hash);
+        let releases_dir = app.releases_dir();
+
+        {
+            let _ = log_writer.log_step_start(&PipelineStep::Install);
+            let mut step_rec = StepRecord::start(PipelineStep::Install);
+
+            match Self::create_release(&repo_dir, &releases_dir, &release_name) {
+                Ok(rdir) => {
+                    release_dir = Some(rdir.clone());
+                    step_rec.finish_success_with_output(format!("Release: {:?}", rdir));
+                    let _ = log_writer.log(&format!("Release created: {:?}", rdir));
+                    let _ = log_writer.log_step_end(&PipelineStep::Install, true);
+                    record.add_step(step_rec);
+                }
+                Err(e) => {
+                    let msg = format!("Release creation failed: {}", e);
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log_error(&msg);
+                    let _ = log_writer.log_step_end(&PipelineStep::Install, false);
+                    record.add_step(step_rec);
+                    record.finish_failure(msg.clone());
+                    app.status = AppStatus::Failed;
+                    let _ = history.save_record(&record);
+                    let _ = log_writer.finalize();
+                    return Ok(DeployResult::failure(
+                        record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                        msg, Some("install".to_string()), false,
+                    ));
+                }
+            }
+        }
+
+        // Save previous symlink target for rollback
+        let previous_release = if app.current_link().is_symlink() {
+            fs::read_link(app.current_link()).ok()
+        } else {
+            None
+        };
+
+        // Activate (atomic symlink swap)
+        let current_link = app.current_link();
+        if let Some(ref rdir) = release_dir {
+            let _ = log_writer.log_step_start(&PipelineStep::Activate);
+            let mut step_rec = StepRecord::start(PipelineStep::Activate);
+
+            match Self::activate_release(rdir, &current_link) {
+                Ok(_) => {
+                    step_rec.finish_success_with_output(format!("{:?} → {:?}", current_link, rdir));
+                    let _ = log_writer.log(&format!("Symlink: {:?} → {:?}", current_link, rdir));
+                    let _ = log_writer.log_step_end(&PipelineStep::Activate, true);
+                    record.add_step(step_rec);
+                }
+                Err(e) => {
+                    let msg = format!("Symlink activation failed: {}", e);
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log_error(&msg);
+                    let _ = log_writer.log_step_end(&PipelineStep::Activate, false);
+                    record.add_step(step_rec);
+                    record.finish_failure(msg.clone());
+                    app.status = AppStatus::Failed;
+                    let _ = history.save_record(&record);
+                    let _ = log_writer.finalize();
+                    return Ok(DeployResult::failure(
+                        record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                        msg, Some("activate".to_string()), false,
+                    ));
+                }
+            }
+        }
+
+        // ── Step 8: Configure (nginx + systemd) ─────────────────────────
+        {
+            let _ = log_writer.log_step_start(&PipelineStep::Configure);
+            let mut step_rec = StepRecord::start(PipelineStep::Configure);
+
+            let config_err = (|| -> std::result::Result<(), String> {
+                let nginx_config = nginx.generate_config(app).map_err(|e| e.to_string())?;
+                nginx.install_config(&nginx_config).map_err(|e| e.to_string())?;
+                if app.app_type.needs_service() {
+                    systemd.install_service(app).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })();
+
+            match config_err {
+                Ok(()) => {
+                    step_rec.finish_success_with_output("Nginx + systemd configured".to_string());
+                    let _ = log_writer.log("Nginx config and systemd unit installed");
+                    let _ = log_writer.log_step_end(&PipelineStep::Configure, true);
+                    record.add_step(step_rec);
+                }
+                Err(msg) => {
+                    step_rec.finish_failure(msg.clone());
+                    let _ = log_writer.log_error(&msg);
+                    let _ = log_writer.log_step_end(&PipelineStep::Configure, false);
+                    record.add_step(step_rec);
+
+                    // Rollback symlink on config failure
+                    let did_rollback = if let Some(ref prev) = previous_release {
+                        let _ = log_writer.log("Rolling back symlink due to config failure...");
+                        Self::activate_release(prev, &current_link).is_ok()
+                    } else {
+                        false
+                    };
+
+                    record.finish_failure(msg.clone());
+                    app.status = AppStatus::Failed;
+                    let _ = history.save_record(&record);
+                    let _ = log_writer.finalize();
+                    return Ok(DeployResult::failure(
+                        record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                        msg, Some("configure".to_string()), did_rollback,
+                    ));
+                }
+            }
+        }
+
+        // Start/restart service and reload nginx
+        if app.app_type.needs_service() {
+            let svc = app.service_name();
+            if let Err(e) = systemd.restart(&svc) {
+                let msg = format!("Service restart warning: {}", e);
+                let _ = log_writer.log_error(&msg);
+                warnings.push(msg);
+            } else {
+                let _ = log_writer.log(&format!("Service '{}' restarted", svc));
+            }
+        }
+
+        if let Err(e) = nginx.reload() {
+            let msg = format!("Nginx reload warning: {}", e);
+            let _ = log_writer.log_error(&msg);
+            warnings.push(msg);
+        } else {
+            let _ = log_writer.log("Nginx reloaded");
+        }
+
+        // ── Step 9: Health check ─────────────────────────────────────────
+        if !options.skip_health_check {
+            let _ = log_writer.log_step_start(&PipelineStep::HealthCheck);
+            let mut step_rec = StepRecord::start(PipelineStep::HealthCheck);
+
+            let health_ok = if let Some(ref health_url) = app.health_check_url {
+                let url = health_url.replace("PORT", &app.port.to_string());
+                let _ = log_writer.log(&format!("Health check: {}", url));
+                match Self::health_check(&url, self.config.health_check_retries, Duration::from_secs(3)) {
+                    Ok(r) => { let _ = log_writer.log(&format!("{}", r)); r.success }
+                    Err(e) => { let _ = log_writer.log_error(&format!("{}", e)); false }
+                }
+            } else if app.app_type.has_static_files() {
+                let r = Self::health_check_static(&app.static_root(), &app.index_file);
+                let _ = log_writer.log(&format!("{}", r));
+                r.success
+            } else {
+                let _ = log_writer.log("No health check configured — OK");
+                true
+            };
+
+            if health_ok {
+                step_rec.finish_success();
+                let _ = log_writer.log_step_end(&PipelineStep::HealthCheck, true);
+                record.add_step(step_rec);
+            } else {
+                let msg = "Health check failed".to_string();
+                step_rec.finish_failure(msg.clone());
+                let _ = log_writer.log_step_end(&PipelineStep::HealthCheck, false);
+                record.add_step(step_rec);
+
+                // Rollback
+                let did_rollback = if let Some(ref prev) = previous_release {
+                    let _ = log_writer.log("Rolling back due to health check failure...");
+                    if Self::activate_release(prev, &current_link).is_ok() {
+                        if app.app_type.needs_service() { let _ = systemd.restart(&app.service_name()); }
+                        let _ = nginx.reload();
+                        let _ = log_writer.log("Rollback complete — previous release restored");
+                        true
+                    } else {
+                        let _ = log_writer.log_error("Rollback failed");
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                record.finish_failure(msg.clone());
+                app.status = AppStatus::Failed;
+                let _ = history.save_record(&record);
+                let _ = log_writer.finalize();
+                return Ok(DeployResult::failure(
+                    record.id, app.name.clone(), branch, start_time.elapsed().as_secs(),
+                    msg, Some("health_check".to_string()), did_rollback,
+                ));
+            }
+        } else {
+            let _ = log_writer.log("Skipping health check (--skip-health-check)");
+        }
+
+        // ── Step 10: Post-deploy ─────────────────────────────────────────
+        {
+            let _ = log_writer.log_step_start(&PipelineStep::PostDeploy);
+            let mut step_rec = StepRecord::start(PipelineStep::PostDeploy);
+            let cleaned = Self::cleanup_old_releases(&releases_dir, self.config.max_deploy_history).unwrap_or(0);
+            step_rec.finish_success_with_output(format!("{} old release(s) removed", cleaned));
+            let _ = log_writer.log(&format!("Cleanup: {} old release(s) removed", cleaned));
+            let _ = log_writer.log_step_end(&PipelineStep::PostDeploy, true);
+            record.add_step(step_rec);
+        }
+
+        // ── Finalize ─────────────────────────────────────────────────────
+        record.release_path = release_dir;
+        record.finish_success();
+
+        app.status = AppStatus::Running;
+        app.current_deploy_id = Some(record.id.clone());
+        app.current_commit = Some(commit_hash.clone());
+        app.last_deployed_at = Some(Utc::now());
+        app.updated_at = Utc::now();
+
+        let _ = history.save_record(&record);
+        let _ = history.prune();
+
+        let duration = start_time.elapsed().as_secs();
+        let _ = log_writer.separator();
+        let _ = log_writer.log(&format!(
+            "Deployment completed successfully in {}s (commit: {})",
+            duration,
+            if commit_hash.len() >= 7 { &commit_hash[..7] } else { &commit_hash }
+        ));
+        let log_path = log_writer.finalize().ok();
+
+        let mut result = DeployResult::success(
+            record.id,
+            app.name.clone(),
+            commit_hash,
+            branch,
+            duration,
+        );
+        result.log_path = log_path.map(|p| p.to_string_lossy().to_string());
+        result.detected_project = detected_project;
+        result.warnings = warnings;
+
+        info!("{}", result);
+        Ok(result)
+    }
+
+    /// Rollback an application to a previous release.
+    ///
+    /// Finds the target deployment (previous successful by default, or a
+    /// specific deploy ID), swaps the symlink back, restarts the service,
+    /// reloads nginx, and records the rollback as a new deploy entry.
+    pub fn rollback(
+        &self,
+        app: &mut Application,
+        nginx: &NginxManager,
+        systemd: &SystemdManager,
+        target_deploy_id: Option<&str>,
+    ) -> std::result::Result<DeployResult, PipelineError> {
+        let start_time = Instant::now();
+        let _lock = self.acquire_lock(&app.name)?;
+
+        info!("Starting rollback for '{}'", app.name);
+
+        let history = DeployHistory::new(app.deploys_dir(), self.config.max_deploy_history)
+            .map_err(|e| PipelineError::RollbackFailed {
+                app: app.name.clone(),
+                message: format!("Failed to init deploy history: {}", e),
+            })?;
+
+        // Find the target release to roll back to
+        let target = if let Some(id) = target_deploy_id {
+            history.load_record(id).map_err(|e| PipelineError::RollbackFailed {
+                app: app.name.clone(),
+                message: format!("Deploy '{}' not found: {}", id, e),
+            })?
+        } else {
+            let current_id = app.current_deploy_id.as_deref().unwrap_or("");
+            history
+                .previous_successful(current_id)
+                .map_err(|e| PipelineError::RollbackFailed {
+                    app: app.name.clone(),
+                    message: format!("Cannot find previous deploy: {}", e),
+                })?
+                .ok_or_else(|| PipelineError::NoPreviousRelease {
+                    app: app.name.clone(),
+                })?
+        };
+
+        let target_path = target.release_path.as_ref().ok_or_else(|| {
+            PipelineError::RollbackFailed {
+                app: app.name.clone(),
+                message: format!("Deploy '{}' has no release path", target.id),
+            }
+        })?;
+
+        if !target_path.exists() {
+            return Err(PipelineError::RollbackFailed {
+                app: app.name.clone(),
+                message: format!("Release dir {:?} no longer exists", target_path),
+            });
+        }
+
+        // Create a rollback deploy record
+        let mut rollback_record = DeployRecord::new_rollback(
+            app.id.clone(),
+            app.name.clone(),
+            app.branch.clone(),
+            target.id.clone(),
+        );
+        rollback_record.set_commit(target.commit_hash.clone(), target.commit_message.clone());
+
+        // Swap the symlink
+        Self::activate_release(target_path, &app.current_link()).map_err(|e| {
+            PipelineError::RollbackFailed {
+                app: app.name.clone(),
+                message: format!("Symlink swap failed: {}", e),
+            }
+        })?;
+
+        // Restart service + reload nginx
+        if app.app_type.needs_service() {
+            if let Err(e) = systemd.restart(&app.service_name()) {
+                warn!("Rollback service restart warning: {}", e);
+            }
+        }
+        if let Err(e) = nginx.reload() {
+            warn!("Rollback nginx reload warning: {}", e);
+        }
+
+        // Update app state
+        app.status = AppStatus::Running;
+        app.current_deploy_id = Some(rollback_record.id.clone());
+        app.current_commit = Some(target.commit_hash.clone());
+        app.last_deployed_at = Some(Utc::now());
+        app.updated_at = Utc::now();
+
+        rollback_record.finish_success();
+        let _ = history.save_record(&rollback_record);
+
+        let duration = start_time.elapsed().as_secs();
+        let result = DeployResult::success(
+            rollback_record.id,
+            app.name.clone(),
+            target.commit_hash.clone(),
+            app.branch.clone(),
+            duration,
+        );
+
+        info!(
+            "Rollback complete: '{}' → deploy '{}' (commit {})",
+            app.name, target.id,
+            if target.commit_hash.len() >= 7 { &target.commit_hash[..7] } else { &target.commit_hash }
+        );
+
+        Ok(result)
     }
 
     // ─────────────────────────────────────────────────────────────────────

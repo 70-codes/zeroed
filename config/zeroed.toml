@@ -317,3 +317,58 @@ collection_interval = 10
 
 # Enable internal statistics tracking
 internal_stats = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application Deployment Management
+# ─────────────────────────────────────────────────────────────────────────────
+[deploy]
+# Enable the deployment management subsystem
+# When disabled, all deploy-related features are inactive but the daemon's
+# core DoS protection continues to function normally.
+enabled = true
+
+# Base directory for all managed application files
+apps_dir = "/var/lib/zeroed/apps"
+
+# Directory for storing SSH keys (used for GitHub authentication)
+ssh_keys_dir = "/var/lib/zeroed/ssh/keys"
+
+# Nginx sites-available directory
+nginx_sites_dir = "/etc/nginx/sites-available"
+
+# Nginx sites-enabled directory (symlinks to sites-available)
+nginx_enabled_dir = "/etc/nginx/sites-enabled"
+
+# Directory for systemd unit files
+systemd_units_dir = "/etc/systemd/system"
+
+# Directory where SSL certificates are stored
+ssl_certs_dir = "/etc/letsencrypt/live"
+
+# Email address for ACME / Let's Encrypt certificate requests
+# Required for SSL automation — leave empty to disable SSL features
+acme_email = ""
+
+# Port range for application allocation (inclusive)
+# Ports below 1024 are never allocated (they require root)
+default_port_range_start = 3000
+default_port_range_end = 9999
+
+# Maximum number of managed applications
+max_apps = 100
+
+# Maximum number of deployment history records to keep per app
+# Older records (and their release directories) are pruned automatically
+max_deploy_history = 10
+
+# Timeout in seconds for build steps (npm run build, cargo build, etc.)
+build_timeout_secs = 600
+
+# Timeout in seconds for health check probes after deployment
+health_check_timeout_secs = 30
+
+# Number of health check retries before marking a deploy as failed
+health_check_retries = 5
+
+# Path to the application registry file (stores all app metadata)
+registry_path = "/var/lib/zeroed/deploy/registry.toml"

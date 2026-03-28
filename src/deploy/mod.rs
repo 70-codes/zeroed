@@ -61,6 +61,9 @@ use std::path::PathBuf;
 // Re-exports for convenience
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Re-export DeployConfig from core::config so downstream code can use
+// `crate::deploy::DeployConfig` as before
+pub use crate::core::config::DeployConfig as DeployConfig;
 pub use app::{AppRegistry, AppStatus, AppType, Application};
 pub use nginx::NginxManager;
 pub use pipeline::DeploymentPipeline;
@@ -68,137 +71,6 @@ pub use ports::PortAllocator;
 pub use ssh::SshKeyManager;
 pub use ssl::SslManager;
 pub use systemd::SystemdManager;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Deploy Configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Top-level deployment configuration, included in the main `zeroed.toml`
-/// under the `[deploy]` section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeployConfig {
-    /// Whether the deployment subsystem is enabled
-    pub enabled: bool,
-
-    /// Base directory for all managed applications
-    pub apps_dir: PathBuf,
-
-    /// Directory for storing SSH keys
-    pub ssh_keys_dir: PathBuf,
-
-    /// Nginx sites-available directory
-    pub nginx_sites_dir: PathBuf,
-
-    /// Nginx sites-enabled directory
-    pub nginx_enabled_dir: PathBuf,
-
-    /// Directory for systemd unit files
-    pub systemd_units_dir: PathBuf,
-
-    /// Directory where SSL certificates are stored (e.g. /etc/letsencrypt/live)
-    pub ssl_certs_dir: PathBuf,
-
-    /// Email address for ACME / Let's Encrypt account registration
-    pub acme_email: String,
-
-    /// Start of the port range available for application allocation
-    pub default_port_range_start: u16,
-
-    /// End of the port range available for application allocation
-    pub default_port_range_end: u16,
-
-    /// Maximum number of managed applications
-    pub max_apps: usize,
-
-    /// Maximum number of deploy history records to keep per app
-    pub max_deploy_history: usize,
-
-    /// Timeout in seconds for build steps
-    pub build_timeout_secs: u64,
-
-    /// Timeout in seconds for health check probes after deploy
-    pub health_check_timeout_secs: u64,
-
-    /// Number of health check retries before marking a deploy as failed
-    pub health_check_retries: u32,
-
-    /// Path to the application registry file
-    pub registry_path: PathBuf,
-}
-
-impl Default for DeployConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            apps_dir: PathBuf::from("/var/lib/zeroed/apps"),
-            ssh_keys_dir: PathBuf::from("/var/lib/zeroed/ssh/keys"),
-            nginx_sites_dir: PathBuf::from("/etc/nginx/sites-available"),
-            nginx_enabled_dir: PathBuf::from("/etc/nginx/sites-enabled"),
-            systemd_units_dir: PathBuf::from("/etc/systemd/system"),
-            ssl_certs_dir: PathBuf::from("/etc/letsencrypt/live"),
-            acme_email: String::new(),
-            default_port_range_start: 3000,
-            default_port_range_end: 9999,
-            max_apps: 100,
-            max_deploy_history: 10,
-            build_timeout_secs: 600,
-            health_check_timeout_secs: 30,
-            health_check_retries: 5,
-            registry_path: PathBuf::from("/var/lib/zeroed/deploy/registry.toml"),
-        }
-    }
-}
-
-impl DeployConfig {
-    /// Validate the deploy configuration, returning errors for any invalid values.
-    pub fn validate(&self) -> Result<()> {
-        if self.acme_email.is_empty() {
-            tracing::warn!(
-                "deploy.acme_email is empty — SSL certificate requests will fail without it"
-            );
-        }
-
-        if self.default_port_range_start >= self.default_port_range_end {
-            return Err(ZeroedError::Config(
-                crate::core::error::ConfigError::ValidationError {
-                    message: format!(
-                        "deploy.default_port_range_start ({}) must be less than default_port_range_end ({})",
-                        self.default_port_range_start, self.default_port_range_end
-                    ),
-                },
-            ));
-        }
-
-        if self.default_port_range_start < 1024 {
-            return Err(ZeroedError::Config(
-                crate::core::error::ConfigError::ValidationError {
-                    message: format!(
-                        "deploy.default_port_range_start ({}) must be >= 1024 to avoid privileged ports",
-                        self.default_port_range_start
-                    ),
-                },
-            ));
-        }
-
-        if self.max_apps == 0 {
-            return Err(ZeroedError::Config(
-                crate::core::error::ConfigError::ValidationError {
-                    message: "deploy.max_apps must be greater than 0".to_string(),
-                },
-            ));
-        }
-
-        if self.build_timeout_secs == 0 {
-            return Err(ZeroedError::Config(
-                crate::core::error::ConfigError::ValidationError {
-                    message: "deploy.build_timeout_secs must be greater than 0".to_string(),
-                },
-            ));
-        }
-
-        Ok(())
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deploy Manager (top-level coordinator)
@@ -241,24 +113,88 @@ impl DeployManager {
     ///
     /// This initializes all sub-managers and creates required directories.
     pub fn new(config: DeployConfig) -> Result<Self> {
-        config.validate()?;
+        // Basic validation
+        if config.default_port_range_start >= config.default_port_range_end {
+            return Err(ZeroedError::Config(
+                crate::core::error::ConfigError::ValidationError {
+                    message: format!(
+                        "deploy.default_port_range_start ({}) must be less than default_port_range_end ({})",
+                        config.default_port_range_start, config.default_port_range_end
+                    ),
+                },
+            ));
+        }
+
+        if config.default_port_range_start < 1024 {
+            return Err(ZeroedError::Config(
+                crate::core::error::ConfigError::ValidationError {
+                    message: format!(
+                        "deploy.default_port_range_start ({}) must be >= 1024 to avoid privileged ports",
+                        config.default_port_range_start
+                    ),
+                },
+            ));
+        }
+
+        if config.max_apps == 0 {
+            return Err(ZeroedError::Config(
+                crate::core::error::ConfigError::ValidationError {
+                    message: "deploy.max_apps must be greater than 0".to_string(),
+                },
+            ));
+        }
+
+        if config.build_timeout_secs == 0 {
+            return Err(ZeroedError::Config(
+                crate::core::error::ConfigError::ValidationError {
+                    message: "deploy.build_timeout_secs must be greater than 0".to_string(),
+                },
+            ));
+        }
+
+        if config.acme_email.is_empty() {
+            tracing::warn!(
+                "deploy.acme_email is empty — SSL certificate requests will fail without it"
+            );
+        }
 
         // Ensure base directories exist
         Self::ensure_directories(&config)?;
 
-        let ssh_keys = SshKeyManager::new(config.ssh_keys_dir.clone())?;
-        let apps = AppRegistry::new(config.registry_path.clone())?;
+        let ssh_keys = SshKeyManager::new(config.ssh_keys_dir.clone())
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to initialize SSH key manager: {}", e),
+            })?;
+        let apps = AppRegistry::new(config.registry_path.clone())
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to initialize app registry: {}", e),
+            })?;
         let nginx = NginxManager::new(
             config.nginx_sites_dir.clone(),
             config.nginx_enabled_dir.clone(),
-        )?;
-        let systemd = SystemdManager::new(config.systemd_units_dir.clone())?;
-        let ssl = SslManager::new(config.ssl_certs_dir.clone(), config.acme_email.clone())?;
+        )
+        .map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to initialize Nginx manager: {}", e),
+        })?;
+        let systemd = SystemdManager::new(config.systemd_units_dir.clone())
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to initialize systemd manager: {}", e),
+            })?;
+        let ssl = SslManager::new(config.ssl_certs_dir.clone(), config.acme_email.clone())
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to initialize SSL manager: {}", e),
+            })?;
         let ports = PortAllocator::new(
             config.default_port_range_start,
             config.default_port_range_end,
-        )?;
-        let pipeline = DeploymentPipeline::new(config.clone())?;
+        )
+        .map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to initialize port allocator: {}", e),
+        })?;
+        let pipeline = DeploymentPipeline::new(config.clone())
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to initialize deployment pipeline: {}", e),
+            })?;
 
         tracing::info!("Deployment manager initialized");
 
@@ -416,6 +352,283 @@ impl DeployManager {
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // High-Level Application Operations
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Deploy an application by name.
+    ///
+    /// Looks up the application in the registry, runs the full deployment
+    /// pipeline, and updates the registry with the result.
+    pub fn deploy_app(
+        &mut self,
+        name: &str,
+        options: &crate::deploy::pipeline::DeployOptions,
+    ) -> Result<crate::deploy::pipeline::DeployResult> {
+        let mut app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?
+            .clone();
+
+        if !app.status.can_deploy() {
+            return Err(ZeroedError::Internal {
+                message: format!(
+                    "Application '{}' is currently {} and cannot be deployed",
+                    name, app.status
+                ),
+            });
+        }
+
+        let result = self
+            .pipeline
+            .deploy(
+                &mut app,
+                &self.ssh_keys,
+                &self.nginx,
+                &self.systemd,
+                options,
+            )
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Deploy pipeline failed: {}", e),
+            })?;
+
+        // Persist the updated app state back to the registry
+        let _ = self.apps.update(name, |a| {
+            a.status = app.status;
+            a.current_deploy_id = app.current_deploy_id.clone();
+            a.current_commit = app.current_commit.clone();
+            a.last_deployed_at = app.last_deployed_at;
+            a.updated_at = app.updated_at;
+            a.build_command = app.build_command.clone();
+            a.build_output_dir = app.build_output_dir.clone();
+            a.start_command = app.start_command.clone();
+        });
+
+        Ok(result)
+    }
+
+    /// Rollback an application to a previous release.
+    ///
+    /// If `target_deploy_id` is `None`, rolls back to the most recent
+    /// successful deployment before the current one.
+    pub fn rollback_app(
+        &mut self,
+        name: &str,
+        target_deploy_id: Option<&str>,
+    ) -> Result<crate::deploy::pipeline::DeployResult> {
+        let mut app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?
+            .clone();
+
+        let result = self
+            .pipeline
+            .rollback(&mut app, &self.nginx, &self.systemd, target_deploy_id)
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Rollback failed: {}", e),
+            })?;
+
+        // Persist the updated app state
+        let _ = self.apps.update(name, |a| {
+            a.status = app.status;
+            a.current_deploy_id = app.current_deploy_id.clone();
+            a.current_commit = app.current_commit.clone();
+            a.last_deployed_at = app.last_deployed_at;
+            a.updated_at = app.updated_at;
+        });
+
+        Ok(result)
+    }
+
+    /// Stop a running application's systemd service.
+    pub fn stop_app(&mut self, name: &str) -> Result<()> {
+        let app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?;
+
+        if !app.app_type.needs_service() {
+            return Err(ZeroedError::Internal {
+                message: format!(
+                    "Application '{}' is a {} and has no service to stop",
+                    name, app.app_type
+                ),
+            });
+        }
+
+        let svc_name = app.service_name();
+        self.systemd.stop(&svc_name).map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to stop service '{}': {}", svc_name, e),
+        })?;
+
+        self.apps
+            .set_status(name, AppStatus::Stopped)
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to update status: {}", e),
+            })?;
+
+        tracing::info!("Application '{}' stopped", name);
+        Ok(())
+    }
+
+    /// Start a stopped application's systemd service.
+    pub fn start_app(&mut self, name: &str) -> Result<()> {
+        let app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?;
+
+        if !app.app_type.needs_service() {
+            return Err(ZeroedError::Internal {
+                message: format!(
+                    "Application '{}' is a {} and has no service to start",
+                    name, app.app_type
+                ),
+            });
+        }
+
+        if !app.has_been_deployed() {
+            return Err(ZeroedError::Internal {
+                message: format!(
+                    "Application '{}' has never been deployed — deploy it first",
+                    name
+                ),
+            });
+        }
+
+        let svc_name = app.service_name();
+        self.systemd.start(&svc_name).map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to start service '{}': {}", svc_name, e),
+        })?;
+
+        self.apps
+            .set_status(name, AppStatus::Running)
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to update status: {}", e),
+            })?;
+
+        tracing::info!("Application '{}' started", name);
+        Ok(())
+    }
+
+    /// Restart a running application's systemd service.
+    pub fn restart_app(&mut self, name: &str) -> Result<()> {
+        let app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?;
+
+        if !app.app_type.needs_service() {
+            return Err(ZeroedError::Internal {
+                message: format!(
+                    "Application '{}' is a {} and has no service to restart",
+                    name, app.app_type
+                ),
+            });
+        }
+
+        let svc_name = app.service_name();
+        self.systemd.restart(&svc_name).map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to restart service '{}': {}", svc_name, e),
+        })?;
+
+        self.apps
+            .set_status(name, AppStatus::Running)
+            .map_err(|e| ZeroedError::Internal {
+                message: format!("Failed to update status: {}", e),
+            })?;
+
+        tracing::info!("Application '{}' restarted", name);
+        Ok(())
+    }
+
+    /// Delete an application entirely.
+    ///
+    /// This performs a full teardown:
+    /// 1. Stop the systemd service (if running)
+    /// 2. Remove the systemd unit file
+    /// 3. Remove the nginx config and reload
+    /// 4. Release the port allocation
+    /// 5. Unregister from the app registry
+    /// 6. Optionally delete all files on disk
+    pub fn delete_app(&mut self, name: &str, delete_files: bool) -> Result<()> {
+        let app = self
+            .apps
+            .get(name)
+            .ok_or_else(|| ZeroedError::Internal {
+                message: format!("Application '{}' not found", name),
+            })?
+            .clone();
+
+        tracing::info!("Deleting application '{}' (delete_files: {})", name, delete_files);
+
+        // 1. Stop the service if it's a backend/hybrid app
+        if app.app_type.needs_service() {
+            let svc_name = app.service_name();
+            if let Err(e) = self.systemd.stop(&svc_name) {
+                tracing::warn!("Could not stop service '{}' during delete: {}", svc_name, e);
+            }
+
+            // 2. Remove the systemd unit file
+            if let Err(e) = self.systemd.remove_service(&svc_name) {
+                tracing::warn!("Could not remove service '{}' during delete: {}", svc_name, e);
+            }
+        }
+
+        // 3. Remove nginx config and reload
+        if let Err(e) = self.nginx.remove_config(name) {
+            tracing::warn!("Could not remove nginx config for '{}': {}", name, e);
+        }
+        let _ = self.nginx.reload();
+
+        // 4. Release the port
+        if app.app_type.needs_port() && app.port > 0 {
+            let _ = self.ports.release(app.port);
+        }
+
+        // 5. Remove SSH key association
+        if let Some(ref key_id) = app.ssh_key_id {
+            if let Some(key) = self.ssh_keys.get_key_mut(key_id) {
+                key.remove_app(&app.id);
+            }
+            let _ = self.ssh_keys.save();
+        }
+
+        // 6. Unregister from the app registry
+        self.apps.unregister(name).map_err(|e| ZeroedError::Internal {
+            message: format!("Failed to unregister app '{}': {}", name, e),
+        })?;
+
+        // 7. Optionally delete files on disk
+        if delete_files {
+            if app.deploy_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&app.deploy_dir) {
+                    tracing::warn!(
+                        "Could not delete app directory {:?}: {}",
+                        app.deploy_dir, e
+                    );
+                } else {
+                    tracing::info!("Deleted app directory: {:?}", app.deploy_dir);
+                }
+            }
+        }
+
+        tracing::info!("Application '{}' deleted successfully", name);
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -522,35 +735,6 @@ mod tests {
         assert_eq!(config.default_port_range_end, 9999);
         assert_eq!(config.max_apps, 100);
         assert_eq!(config.max_deploy_history, 10);
-    }
-
-    #[test]
-    fn test_deploy_config_validation_port_range() {
-        let mut config = DeployConfig::default();
-        config.default_port_range_start = 9999;
-        config.default_port_range_end = 3000;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_deploy_config_validation_privileged_port() {
-        let mut config = DeployConfig::default();
-        config.default_port_range_start = 80;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_deploy_config_validation_max_apps_zero() {
-        let mut config = DeployConfig::default();
-        config.max_apps = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_deploy_config_validation_valid() {
-        let config = DeployConfig::default();
-        // Will warn about empty acme_email but should not error
-        assert!(config.validate().is_ok());
     }
 
     #[test]
